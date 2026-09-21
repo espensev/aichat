@@ -97,104 +97,134 @@ pub async fn openai_chat_completions(
     openai_extract_chat_completions(&data)
 }
 
+#[derive(Default)]
+struct OpenAiChatStreamState {
+    call_id: String,
+    current_index: Option<u64>,
+    function_name: String,
+    function_arguments: String,
+    function_id: String,
+    reasoning_state: i32,
+}
+
 pub async fn openai_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut call_id = String::new();
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
-    let handle = |message: SseMmessage| -> Result<bool> {
-        if message.data == "[DONE]" {
-            if !function_name.is_empty() {
-                if function_arguments.is_empty() {
-                    function_arguments = String::from("{}");
-                }
-                let arguments: Value = function_arguments.parse().with_context(|| {
-                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                })?;
-                handler.tool_call(ToolCall::new(
-                    function_name.clone(),
-                    arguments,
-                    normalize_function_id(&function_id),
-                ))?;
-            }
-            return Ok(true);
-        }
-        let data: Value = serde_json::from_str(&message.data)?;
-        debug!("stream-data: {data}");
-        if let Some(text) = data["choices"][0]["delta"]["content"]
-            .as_str()
-            .filter(|v| !v.is_empty())
-        {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-            }
-            handler.text(text)?;
-        } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
-            .as_str()
-            .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
-            .filter(|v| !v.is_empty())
-        {
-            if reasoning_state == 0 {
-                handler.text("<think>\n")?;
-                reasoning_state = 1;
-            }
-            handler.text(text)?;
-        }
-        if let (Some(function), index, id) = (
-            data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
-            data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
-            data["choices"][0]["delta"]["tool_calls"][0]["id"]
-                .as_str()
-                .filter(|v| !v.is_empty()),
-        ) {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-            }
-            let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
-            if maybe_call_id != call_id && maybe_call_id.len() >= call_id.len() {
-                if !function_name.is_empty() {
-                    if function_arguments.is_empty() {
-                        function_arguments = String::from("{}");
-                    }
-                    let arguments: Value = function_arguments.parse().with_context(|| {
-                        format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                    })?;
-                    handler.tool_call(ToolCall::new(
-                        function_name.clone(),
-                        arguments,
-                        normalize_function_id(&function_id),
-                    ))?;
-                }
-                function_name.clear();
-                function_arguments.clear();
-                function_id.clear();
-                call_id = maybe_call_id;
-            }
-            if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                if name.starts_with(&function_name) {
-                    function_name = name.to_string();
-                } else {
-                    function_name.push_str(name);
-                }
-            }
-            if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
-                function_arguments.push_str(arguments);
-            }
-            if let Some(id) = id {
-                function_id = id.to_string();
-            }
-        }
-        Ok(false)
-    };
+    let mut state = OpenAiChatStreamState::default();
+    sse_stream(builder, |message| {
+        handle_openai_stream_message(&mut state, handler, message)
+    })
+    .await
+}
 
-    sse_stream(builder, handle).await
+fn handle_openai_stream_message(
+    state: &mut OpenAiChatStreamState,
+    handler: &mut SseHandler,
+    message: SseMmessage,
+) -> Result<bool> {
+    if message.data == "[DONE]" {
+        flush_openai_stream_tool_call(state, handler)?;
+        return Ok(true);
+    }
+    let data: Value = serde_json::from_str(&message.data)?;
+    debug!("stream-data: {data}");
+    if let Some(text) = data["choices"][0]["delta"]["content"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+    {
+        if state.reasoning_state == 1 {
+            handler.text("\n</think>\n\n")?;
+            state.reasoning_state = 0;
+        }
+        handler.text(text)?;
+    } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
+        .as_str()
+        .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
+        .filter(|v| !v.is_empty())
+    {
+        if state.reasoning_state == 0 {
+            handler.text("<think>\n")?;
+            state.reasoning_state = 1;
+        }
+        handler.text(text)?;
+    }
+    if let (Some(function), index, id) = (
+        data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
+        data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
+        data["choices"][0]["delta"]["tool_calls"][0]["id"]
+            .as_str()
+            .filter(|v| !v.is_empty()),
+    ) {
+        if state.reasoning_state == 1 {
+            handler.text("\n</think>\n\n")?;
+            state.reasoning_state = 0;
+        }
+        // Flush on a new id or index while an in-progress call exists.
+        // Omitted-id continuations at the same index keep accumulating.
+        let is_new_call = if state.function_name.is_empty() {
+            false
+        } else if let Some(id_str) = id {
+            let maybe_call_id = format!("{}/{}", id_str, index.unwrap_or_default());
+            state.call_id.is_empty() || maybe_call_id != state.call_id
+        } else if let (Some(idx), Some(current)) = (index, state.current_index) {
+            idx != current
+        } else {
+            false
+        };
+        if is_new_call {
+            flush_openai_stream_tool_call(state, handler)?;
+            state.function_name.clear();
+            state.function_arguments.clear();
+            state.function_id.clear();
+            if id.is_none() {
+                state.call_id.clear();
+            }
+        }
+        if let Some(id_str) = id {
+            state.call_id = format!("{}/{}", id_str, index.unwrap_or_default());
+        }
+        if let Some(idx) = index {
+            state.current_index = Some(idx);
+        }
+        if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+            if name.starts_with(&state.function_name) {
+                state.function_name = name.to_string();
+            } else {
+                state.function_name.push_str(name);
+            }
+        }
+        if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
+            state.function_arguments.push_str(arguments);
+        }
+        if let Some(id) = id {
+            state.function_id = id.to_string();
+        }
+    }
+    Ok(false)
+}
+
+fn flush_openai_stream_tool_call(
+    state: &mut OpenAiChatStreamState,
+    handler: &mut SseHandler,
+) -> Result<()> {
+    if state.function_name.is_empty() {
+        return Ok(());
+    }
+    if state.function_arguments.is_empty() {
+        state.function_arguments = String::from("{}");
+    }
+    let function_name = &state.function_name;
+    let function_arguments = &state.function_arguments;
+    let arguments: Value = function_arguments.parse().with_context(|| {
+        format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
+    })?;
+    handler.tool_call(ToolCall::new(
+        state.function_name.clone(),
+        arguments,
+        normalize_function_id(&state.function_id),
+    ))
 }
 
 pub async fn openai_embeddings(
@@ -404,5 +434,158 @@ fn normalize_function_id(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::create_abort_signal;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn dispatched_tool_calls(chunks: &[&str]) -> Result<Vec<ToolCall>> {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = OpenAiChatStreamState::default();
+        for data in chunks {
+            let done = handle_openai_stream_message(
+                &mut state,
+                &mut handler,
+                SseMmessage {
+                    event: "message".into(),
+                    data: (*data).to_string(),
+                },
+            )?;
+            if done {
+                break;
+            }
+        }
+        Ok(handler.take().1)
+    }
+
+    #[test]
+    fn glm5_omitted_id_continuation_accumulates_tool_args() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_95df1cc8dabc4b959bbbc431","type":"function","function":{"name":"web_search","arguments":""}}]}}],"model":"z-ai/glm-5-20260211","provider":"AtlasCloud"}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"max_results\": 10, \"query\": \"ESP32 command line development best practices\""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(
+            calls[0].id.as_deref(),
+            Some("call_95df1cc8dabc4b959bbbc431")
+        );
+        assert_eq!(
+            calls[0].arguments,
+            json!({
+                "max_results": 10,
+                "query": "ESP32 command line development best practices"
+            })
+        );
+    }
+
+    #[test]
+    fn single_chunk_tool_call_dispatches_once() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_grok","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"hello\",\"max_results\":5}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].id.as_deref(), Some("call_grok"));
+        assert_eq!(
+            calls[0].arguments,
+            json!({
+                "query": "hello",
+                "max_results": 5
+            })
+        );
+    }
+
+    #[test]
+    fn new_id_starts_new_tool_call() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_verylongidentifier","type":"function","function":{"name":"alpha","arguments":"{\"x\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_z","type":"function","function":{"name":"beta","arguments":"{\"y\":2}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "alpha");
+        assert_eq!(calls[0].id.as_deref(), Some("call_verylongidentifier"));
+        assert_eq!(calls[0].arguments, json!({"x": 1}));
+        assert_eq!(calls[1].name, "beta");
+        assert_eq!(calls[1].id.as_deref(), Some("call_z"));
+        assert_eq!(calls[1].arguments, json!({"y": 2}));
+    }
+
+    #[test]
+    fn new_index_starts_new_tool_call() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_aaa","type":"function","function":{"name":"alpha","arguments":"{\"x\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_bbb","type":"function","function":{"name":"beta","arguments":"{\"y\":2}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "alpha");
+        assert_eq!(calls[0].id.as_deref(), Some("call_aaa"));
+        assert_eq!(calls[0].arguments, json!({"x": 1}));
+        assert_eq!(calls[1].name, "beta");
+        assert_eq!(calls[1].id.as_deref(), Some("call_bbb"));
+        assert_eq!(calls[1].arguments, json!({"y": 2}));
+    }
+
+    #[test]
+    fn new_index_without_id_starts_new_tool_call() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_aaa","type":"function","function":{"name":"alpha","arguments":"{\"x\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"beta","arguments":"{\"y\":2}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "alpha");
+        assert_eq!(calls[0].id.as_deref(), Some("call_aaa"));
+        assert_eq!(calls[0].arguments, json!({"x": 1}));
+        assert_eq!(calls[1].name, "beta");
+        assert_eq!(calls[1].id, None);
+        assert_eq!(calls[1].arguments, json!({"y": 2}));
+    }
+
+    #[test]
+    fn new_id_after_omitted_id_index_change_flushes_in_progress_call() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_aaa","type":"function","function":{"name":"alpha","arguments":"{\"x\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"beta","arguments":"{\"y\":2}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":2,"id":"call_ccc","type":"function","function":{"name":"gamma","arguments":"{\"z\":3}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert!(
+            calls.len() >= 2,
+            "expected distinct tool calls, got {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|call| call.arguments.is_object()),
+            "arguments must not concatenate across calls, got {calls:?}"
+        );
+        assert_eq!(calls[0].name, "alpha");
+        assert_eq!(calls[0].arguments, json!({"x": 1}));
+        let last = calls.last().unwrap();
+        assert_eq!(last.name, "gamma");
+        assert_eq!(last.id.as_deref(), Some("call_ccc"));
+        assert_eq!(last.arguments, json!({"z": 3}));
+        assert!(
+            calls.iter().any(|call| {
+                call.name == "beta" && call.arguments == json!({"y": 2})
+            }),
+            "beta must be flushed before gamma, got {calls:?}"
+        );
     }
 }
