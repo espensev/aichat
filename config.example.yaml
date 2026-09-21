@@ -167,7 +167,7 @@ clients:
     api_base: https://api.mistral.ai/v1
     api_key: xxx
 
-  # See https://docs.x.ai/docs
+  # See https://docs.x.ai/developers/models
   - type: openai-compatible
     name: xai
     api_base: https://api.x.ai/v1

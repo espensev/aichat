@@ -391,10 +391,34 @@
       max_input_tokens: 4096
 
 # Links:
-#  - https://docs.x.ai/docs/models
-#  - https://docs.x.ai/docs/api-reference#chat-completions
+#  - https://docs.x.ai/developers/models
+#  - https://docs.x.ai/developers/api-reference#chat-completions
 - provider: xai
   models:
+    - name: grok-4.6
+      max_input_tokens: 500000
+      input_price: 2
+      output_price: 6
+      supports_vision: true
+      supports_function_calling: true
+    - name: grok-4.5
+      max_input_tokens: 500000
+      input_price: 2
+      output_price: 6
+      supports_vision: true
+      supports_function_calling: true
+    - name: grok-4.3
+      max_input_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      supports_vision: true
+      supports_function_calling: true
+    - name: grok-build-0.1
+      max_input_tokens: 256000
+      input_price: 1
+      output_price: 2
+      supports_vision: true
+      supports_function_calling: true
     - name: grok-4-1-fast-non-reasoning
       max_input_tokens: 2000000
       input_price: 0.2
