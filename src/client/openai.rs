@@ -99,12 +99,17 @@ pub async fn openai_chat_completions(
 
 #[derive(Default)]
 struct OpenAiChatStreamState {
-    call_id: String,
+    tool_calls: Vec<OpenAiStreamToolCall>,
     current_index: Option<u64>,
+    reasoning_state: i32,
+}
+
+#[derive(Default)]
+struct OpenAiStreamToolCall {
+    index: u64,
     function_name: String,
     function_arguments: String,
     function_id: String,
-    reasoning_state: i32,
 }
 
 pub async fn openai_chat_completions_streaming(
@@ -125,7 +130,9 @@ fn handle_openai_stream_message(
     message: SseMmessage,
 ) -> Result<bool> {
     if message.data == "[DONE]" {
-        flush_openai_stream_tool_call(state, handler)?;
+        for call in &mut state.tool_calls {
+            flush_openai_stream_tool_call(call, handler)?;
+        }
         return Ok(true);
     }
     let data: Value = serde_json::from_str(&message.data)?;
@@ -150,63 +157,62 @@ fn handle_openai_stream_message(
         }
         handler.text(text)?;
     }
-    if let (Some(function), index, id) = (
-        data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
-        data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
-        data["choices"][0]["delta"]["tool_calls"][0]["id"]
-            .as_str()
-            .filter(|v| !v.is_empty()),
-    ) {
+    for tool_call in data["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let Some(function) = tool_call["function"].as_object() else {
+            continue;
+        };
+        let index = tool_call["index"]
+            .as_u64()
+            .or(state.current_index)
+            .unwrap_or_default();
+        let id = tool_call["id"].as_str().filter(|v| !v.is_empty());
         if state.reasoning_state == 1 {
             handler.text("\n</think>\n\n")?;
             state.reasoning_state = 0;
         }
-        // Flush on a new id or index while an in-progress call exists.
-        // Omitted-id continuations at the same index keep accumulating.
-        let is_new_call = if state.function_name.is_empty() {
-            false
-        } else if let Some(id_str) = id {
-            let maybe_call_id = format!("{}/{}", id_str, index.unwrap_or_default());
-            state.call_id.is_empty() || maybe_call_id != state.call_id
-        } else if let (Some(idx), Some(current)) = (index, state.current_index) {
-            idx != current
-        } else {
-            false
-        };
-        if is_new_call {
-            flush_openai_stream_tool_call(state, handler)?;
-            state.function_name.clear();
-            state.function_arguments.clear();
-            state.function_id.clear();
-            if id.is_none() {
-                state.call_id.clear();
-            }
-        }
-        if let Some(id_str) = id {
-            state.call_id = format!("{}/{}", id_str, index.unwrap_or_default());
-        }
-        if let Some(idx) = index {
-            state.current_index = Some(idx);
-        }
+        // Keep arrival order, including providers that reuse an index with a new id.
+        let position = state
+            .tool_calls
+            .iter()
+            .rposition(|call| call.index == index)
+            .filter(|&position| {
+                let call = &state.tool_calls[position];
+                id.is_none()
+                    || call.function_name.is_empty()
+                    || id == Some(call.function_id.as_str())
+            })
+            .unwrap_or_else(|| {
+                state.tool_calls.push(OpenAiStreamToolCall {
+                    index,
+                    ..Default::default()
+                });
+                state.tool_calls.len() - 1
+            });
+        state.current_index = Some(index);
+        let call = &mut state.tool_calls[position];
         if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-            if name.starts_with(&state.function_name) {
-                state.function_name = name.to_string();
+            if name.starts_with(&call.function_name) {
+                call.function_name = name.to_string();
             } else {
-                state.function_name.push_str(name);
+                call.function_name.push_str(name);
             }
         }
         if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
-            state.function_arguments.push_str(arguments);
+            call.function_arguments.push_str(arguments);
         }
         if let Some(id) = id {
-            state.function_id = id.to_string();
+            call.function_id = id.to_string();
         }
     }
     Ok(false)
 }
 
 fn flush_openai_stream_tool_call(
-    state: &mut OpenAiChatStreamState,
+    state: &mut OpenAiStreamToolCall,
     handler: &mut SseHandler,
 ) -> Result<()> {
     if state.function_name.is_empty() {
@@ -508,6 +514,139 @@ mod tests {
     }
 
     #[test]
+    fn multiple_tool_calls_in_one_chunk_are_all_dispatched() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"alpha","arguments":"{\"x\":1}"}},{"index":1,"id":"call_b","function":{"name":"beta","arguments":"{\"y\":2}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "alpha");
+        assert_eq!(calls[0].id.as_deref(), Some("call_a"));
+        assert_eq!(calls[0].arguments, json!({"x": 1}));
+        assert_eq!(calls[1].name, "beta");
+        assert_eq!(calls[1].id.as_deref(), Some("call_b"));
+        assert_eq!(calls[1].arguments, json!({"y": 2}));
+    }
+
+    #[test]
+    fn interleaved_tool_calls_accumulate_arguments_and_names_by_index() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"web_","arguments":"{\"query\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"weather","arguments":"{\"city\":\""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"search","arguments":"\"rust\"}"}},{"index":1,"function":{"arguments":"Oslo\"}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].id.as_deref(), Some("call_a"));
+        assert_eq!(calls[0].arguments, json!({"query": "rust"}));
+        assert_eq!(calls[1].name, "weather");
+        assert_eq!(calls[1].id.as_deref(), Some("call_b"));
+        assert_eq!(calls[1].arguments, json!({"city": "Oslo"}));
+    }
+
+    #[test]
+    fn interleaved_calls_preserve_first_seen_order() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"beta","arguments":"{\"y\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"alpha","arguments":"{\"x\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "beta");
+        assert_eq!(calls[0].arguments, json!({"y": 2}));
+        assert_eq!(calls[1].name, "alpha");
+        assert_eq!(calls[1].arguments, json!({"x": 1}));
+    }
+
+    #[test]
+    fn omitted_index_continues_the_current_call() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":3,"id":"call_a","function":{"name":"alpha","arguments":"{\"x\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_deref(), Some("call_a"));
+        assert_eq!(calls[0].arguments, json!({"x": 1}));
+    }
+
+    #[test]
+    fn malformed_tool_arguments_keep_the_contextual_error() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"alpha","arguments":"{\"x\":"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let error = dispatched_tool_calls(&chunks).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Tool call 'alpha' have non-JSON arguments '{\"x\":'"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_calls_reach_the_handler_through_sse() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let chunks = [
+            r#"{"choices":[{"delta":{"reasoning_content":"Checking"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"alpha","arguments":"{\"x\":"}},{"index":1,"id":"call_b","function":{"name":"beta","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let body = chunks
+            .iter()
+            .map(|data| format!("data: {data}\n\n"))
+            .collect::<String>();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request = client
+            .get(format!("http://{address}/chat/completions"))
+            .timeout(Duration::from_secs(5));
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let result =
+            openai_chat_completions_streaming(request, &mut handler, &Model::default()).await;
+        server.join().unwrap();
+        result.unwrap();
+        let (text, calls) = handler.take();
+        assert_eq!(text, "<think>\nChecking\n</think>\n\n");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "alpha");
+        assert_eq!(calls[0].id.as_deref(), Some("call_a"));
+        assert_eq!(calls[0].arguments, json!({"x": 1}));
+        assert_eq!(calls[1].name, "beta");
+        assert_eq!(calls[1].id.as_deref(), Some("call_b"));
+        assert_eq!(calls[1].arguments, json!({}));
+    }
+
+    #[test]
     fn new_id_starts_new_tool_call() {
         let chunks = [
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_verylongidentifier","type":"function","function":{"name":"alpha","arguments":"{\"x\":1}"}}]}}]}"#,
@@ -521,6 +660,23 @@ mod tests {
         assert_eq!(calls[0].arguments, json!({"x": 1}));
         assert_eq!(calls[1].name, "beta");
         assert_eq!(calls[1].id.as_deref(), Some("call_z"));
+        assert_eq!(calls[1].arguments, json!({"y": 2}));
+    }
+
+    #[test]
+    fn new_id_after_an_unidentified_call_at_the_same_index_starts_a_call() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"alpha","arguments":"{\"x\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_b","function":{"name":"beta","arguments":"{\"y\":2}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let calls = dispatched_tool_calls(&chunks).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "alpha");
+        assert_eq!(calls[0].id, None);
+        assert_eq!(calls[0].arguments, json!({"x": 1}));
+        assert_eq!(calls[1].name, "beta");
+        assert_eq!(calls[1].id.as_deref(), Some("call_b"));
         assert_eq!(calls[1].arguments, json!({"y": 2}));
     }
 
@@ -582,9 +738,9 @@ mod tests {
         assert_eq!(last.id.as_deref(), Some("call_ccc"));
         assert_eq!(last.arguments, json!({"z": 3}));
         assert!(
-            calls.iter().any(|call| {
-                call.name == "beta" && call.arguments == json!({"y": 2})
-            }),
+            calls
+                .iter()
+                .any(|call| { call.name == "beta" && call.arguments == json!({"y": 2}) }),
             "beta must be flushed before gamma, got {calls:?}"
         );
     }
