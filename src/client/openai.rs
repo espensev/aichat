@@ -118,10 +118,16 @@ pub async fn openai_chat_completions_streaming(
     _model: &Model,
 ) -> Result<()> {
     let mut state = OpenAiChatStreamState::default();
+    let mut finished = false;
     sse_stream(builder, |message| {
-        handle_openai_stream_message(&mut state, handler, message)
+        finished = handle_openai_stream_message(&mut state, handler, message)?;
+        Ok(finished)
     })
-    .await
+    .await?;
+    if !finished && !state.tool_calls.is_empty() {
+        bail!("Tool call stream ended before [DONE]");
+    }
+    Ok(())
 }
 
 fn handle_openai_stream_message(
@@ -589,18 +595,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn streamed_tool_calls_reach_the_handler_through_sse() {
+    async fn dispatch_sse_stream(chunks: &[&str]) -> (Result<()>, SseHandler) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::time::Duration;
 
-        let chunks = [
-            r#"{"choices":[{"delta":{"reasoning_content":"Checking"}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"alpha","arguments":"{\"x\":"}},{"index":1,"id":"call_b","function":{"name":"beta","arguments":""}}]}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
-            "[DONE]",
-        ];
         let body = chunks
             .iter()
             .map(|data| format!("data: {data}\n\n"))
@@ -634,6 +633,18 @@ mod tests {
         let result =
             openai_chat_completions_streaming(request, &mut handler, &Model::default()).await;
         server.join().unwrap();
+        (result, handler)
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_calls_reach_the_handler_through_sse() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"reasoning_content":"Checking"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"alpha","arguments":"{\"x\":"}},{"index":1,"id":"call_b","function":{"name":"beta","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
+            "[DONE]",
+        ];
+        let (result, handler) = dispatch_sse_stream(&chunks).await;
         result.unwrap();
         let (text, calls) = handler.take();
         assert_eq!(text, "<think>\nChecking\n</think>\n\n");
@@ -644,6 +655,46 @@ mod tests {
         assert_eq!(calls[1].name, "beta");
         assert_eq!(calls[1].id.as_deref(), Some("call_b"));
         assert_eq!(calls[1].arguments, json!({}));
+    }
+
+    #[tokio::test]
+    async fn sse_eof_rejects_unterminated_tool_calls() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"alpha","arguments":"{\"x\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"beta","arguments":"{\"y\":2}"}}]}}]}"#,
+        ];
+        let (result, handler) = dispatch_sse_stream(&chunks).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Tool call stream ended before [DONE]"
+        );
+        assert!(handler.tool_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sse_eof_rejects_partial_tool_arguments() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"alpha","arguments":"{\"x\":"}}]}}]}"#,
+        ];
+        let (result, handler) = dispatch_sse_stream(&chunks).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Tool call stream ended before [DONE]"
+        );
+        assert!(handler.tool_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_only_sse_can_end_without_done() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"content":"Hello"}}]}"#,
+            r#"{"choices":[{"delta":{"content":" world"}}]}"#,
+        ];
+        let (result, handler) = dispatch_sse_stream(&chunks).await;
+        result.unwrap();
+        let (text, calls) = handler.take();
+        assert_eq!(text, "Hello world");
+        assert!(calls.is_empty());
     }
 
     #[test]
